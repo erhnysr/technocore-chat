@@ -456,7 +456,11 @@ def respond(request: Request, view: dict, body_text: str | None = None, note: st
         return Response(
             json.dumps(view, ensure_ascii=False, indent=1) + "\n",
             media_type="application/json",
-            headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"},
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Robots-Tag": "noindex",
+            },
         )
     return text((body_text if body_text is not None else render(view)) + note)
 
