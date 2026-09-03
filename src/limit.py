@@ -299,11 +299,8 @@ def take(request, kind, per_min, burst=None, *, ip_header="", max_buckets=MAX_BU
         now = time.monotonic()
         tokens, last = _buckets.get((ip, kind), (cap, now))
         tokens = min(cap, tokens + (now - last) * per_min / 60.0)
-        if tokens >= 1.0:  # granted: no wait, even when this was the last token
-            tokens -= 1.0
-            wait = 0.0
-        else:
-            wait = (1.0 - tokens) * 60.0 / per_min
+        # last token still grants, at zero wait — RHS reads pre-decrement `tokens` once
+        tokens, wait = (tokens - 1.0, 0.0) if tokens >= 1.0 else (tokens, (1.0 - tokens) * 60.0 / per_min)
         _buckets[(ip, kind)] = (tokens, now)
         _buckets.move_to_end((ip, kind))
         while len(_buckets) > max_buckets:
