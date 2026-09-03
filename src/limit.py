@@ -67,6 +67,11 @@ FREE_PATHS = "/, /llms.txt, /skill.md, /patterns.md, /interop.md, /auth.md, /ope
 # limiter state — which is why the authoritative limit belongs in the proxy (see README).
 MAX_BUCKETS = 20_000
 _buckets: OrderedDict[tuple[str, str], tuple[float, float]] = OrderedDict()
+# Guards every read-modify-write on _buckets (take() and refund() both touch it).
+# A bare get()+set() pair is two ops with a GIL-switch point in between; under
+# threadpool concurrency that gap is enough for a second request on the same
+# (ip, kind) to read a stale or evicted state and grant tokens it should not.
+_bucket_lock = threading.Lock()
 
 # Request counters for /stats. Deliberately in-process (the store's counters are the
 # durable ones): traffic is only ever read as a rate, and a rate needs the uptime that
@@ -289,19 +294,20 @@ def take(request, kind, per_min, burst=None, *, ip_header="", max_buckets=MAX_BU
     ip = client_ip(request, ip_header)
     if len(_identities) < MAX_IDENTITIES:
         _identities.add(ip)
-    now = time.monotonic()
     cap = float(per_min if burst is None else burst)
-    tokens, last = _buckets.get((ip, kind), (cap, now))
-    tokens = min(cap, tokens + (now - last) * per_min / 60.0)
-    if tokens >= 1.0:  # granted: no wait, even when this was the last token
-        tokens -= 1.0
-        wait = 0.0
-    else:
-        wait = (1.0 - tokens) * 60.0 / per_min
-    _buckets.pop((ip, kind), None)
-    _buckets[(ip, kind)] = (tokens, now)
-    while len(_buckets) > max_buckets:
-        _buckets.popitem(last=False)
+    with _bucket_lock:
+        now = time.monotonic()
+        tokens, last = _buckets.get((ip, kind), (cap, now))
+        tokens = min(cap, tokens + (now - last) * per_min / 60.0)
+        if tokens >= 1.0:  # granted: no wait, even when this was the last token
+            tokens -= 1.0
+            wait = 0.0
+        else:
+            wait = (1.0 - tokens) * 60.0 / per_min
+        _buckets[(ip, kind)] = (tokens, now)
+        _buckets.move_to_end((ip, kind))
+        while len(_buckets) > max_buckets:
+            _buckets.popitem(last=False)
     # Counted at the one point every rate-limited route already funnels through, so a new
     # route cannot forget to count itself. In-process, so these reset on restart — /stats
     # reports them next to `uptime_seconds`, which is what makes them readable.
@@ -319,8 +325,9 @@ def refund(request, kind, per_min, burst=None, *, ip_header="") -> None:
     """
     ip = client_ip(request, ip_header)
     cap = float(per_min if burst is None else burst)
-    tokens, last = _buckets.get((ip, kind), (cap, time.monotonic()))
-    _buckets[(ip, kind)] = (min(cap, tokens + 1.0), last)
+    with _bucket_lock:
+        tokens, last = _buckets.get((ip, kind), (cap, time.monotonic()))
+        _buckets[(ip, kind)] = (min(cap, tokens + 1.0), last)
     config._dbg(1, "refund", ip=ip, kind=kind)
 
 
