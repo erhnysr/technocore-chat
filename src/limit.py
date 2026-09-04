@@ -71,6 +71,14 @@ _buckets: OrderedDict[tuple[str, str], tuple[float, float]] = OrderedDict()
 # A bare get()+set() pair is two ops with a GIL-switch point in between; under
 # threadpool concurrency that gap is enough for a second request on the same
 # (ip, kind) to read a stale or evicted state and grant tokens it should not.
+# This is a single module-level lock, so it serializes every token-bucket decision
+# process-wide, not just same-(ip, kind) ones — and take() runs on every rate-limited
+# route, so that is the request path, not a cold corner. Deliberate, not an oversight:
+# per the note above the authoritative limit already lives in the reverse proxy and this
+# is process-local best-effort, so the critical section is a handful of dict operations
+# with no I/O in it, and one uncontended acquire per request is cheaper than the 500 it
+# removes. Scope, so the claim stays true: the duplicate ring keeps its own _dupes_lock
+# and the waiter counters stay unlocked on the event loop. This covers _buckets, nothing else.
 _bucket_lock = threading.Lock()
 
 # Request counters for /stats. Deliberately in-process (the store's counters are the
